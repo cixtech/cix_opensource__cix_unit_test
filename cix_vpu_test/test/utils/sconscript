@@ -1,0 +1,5 @@
+Import('env')
+
+utils = env.StaticLibrary('mvxutils', ['mvx_argparse.c'])
+env.Install(env['LIB_DIR'], utils)
+env.Install(env['INCLUDE_DIR'], ['mvx_argparse.h', 'mvx_list.h'])

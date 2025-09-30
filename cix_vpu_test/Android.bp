@@ -1,0 +1,106 @@
+//
+// Copyright 2024 Cix Technology Group Co., Ltd.
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+cc_defaults {
+    name: "mvx_test_defaults",
+    vendor: true,
+
+    cflags: [
+        "-Wall",
+        "-g",
+        "-O0",
+        "-Wno-unused-parameter",
+    ],
+    cppflags: [
+        "-frtti",
+        "-fexceptions",
+    ],
+    rtti: true,
+    relative_install_path: "amvx",
+}
+
+cc_defaults {
+    name: "mvx_player_defaults",
+
+    defaults: ["mvx_test_defaults"],
+
+    srcs: ["test/mvx_player/mvx_player.cpp"],
+    include_dirs: [
+        "device/cix/common/kernel-headers/linux",
+    ],
+    local_include_dirs: [
+        "test/utils",
+        "test/mvx_player",
+        "test/cix_pipe_dummy",
+    ],
+    static_libs: [
+        "libmvxutils",
+        "libcix_pipe_dummy",
+    ],
+    shared_libs: [
+        "libdrm_android",
+        "libdrm_android_cix",
+    ],
+}
+
+cc_library_static {
+    name: "libmvxutils",
+
+    defaults: ["mvx_test_defaults"],
+    srcs: ["test/utils/mvx_argparse.c"],
+}
+
+cc_library_static {
+    name: "libcix_pipe_dummy",
+
+    defaults: ["mvx_test_defaults"],
+    srcs: ["test/cix_pipe_dummy/cix_pipe_dummy.c"],
+}
+
+cc_binary {
+    name: "mvx_decoder",
+
+    defaults:["mvx_player_defaults"],
+    srcs: ["test/mvx_player/mvx_decoder.cpp"],
+}
+
+cc_binary {
+    name: "mvx_encoder",
+
+    defaults:["mvx_player_defaults"],
+    srcs: ["test/mvx_player/mvx_encoder.cpp"],
+}
+
+cc_binary {
+    name: "mvx_info",
+
+    defaults:["mvx_player_defaults"],
+    srcs: ["test/mvx_player/mvx_info.cpp"],
+}
+
+cc_binary {
+    name: "mvx_logd",
+
+    defaults: ["mvx_test_defaults"],
+    srcs: [
+        "tools/logd/mvx_logd.cpp",
+        "tools/logd/mvx_logd_fwif_v2.cpp",
+    ],
+    include_dirs: [
+        "vendor/cix_opensource/vpu/vpu_driver/driver",
+        "vendor/cix_opensource/vpu/vpu_driver/driver/external/fw_v2",
+    ],
+}

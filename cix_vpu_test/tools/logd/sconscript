@@ -1,0 +1,6 @@
+Import('env')
+lenv = env.Clone()
+
+lenv.Append(CPPPATH = ['#driver/external', '#driver'])
+logd = lenv.Program('mvx_logd', ['mvx_logd.cpp', 'mvx_logd_fwif_v2.cpp'])
+lenv.Install(env['BIN_DIR'], logd)

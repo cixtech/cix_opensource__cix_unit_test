@@ -1,0 +1,20 @@
+import os
+
+Import('env')
+
+# env.Append(CPPDEFINES=['ENABLE_DISPLAY', 'ENABLE_CPIPE'])
+if 'PATH_OUT' in os.environ:
+    env.Append(CPPPATH = [os.path.join(os.environ['PATH_OUT'].strip(), 'sysroot', 'usr', 'share', 'cix', 'include')])
+    env.Append(LIBPATH = [os.path.join(os.environ['PATH_OUT'].strip(), 'sysroot', 'usr', 'share', 'cix', 'lib')])
+
+player = env.Object('mvx_player.cpp')
+libs = ['mvxutils']
+
+mvx_decoder = env.Program('mvx_decoder', ['mvx_decoder.cpp', player], LIBS = libs)
+env.Install(env['BIN_DIR'], mvx_decoder)
+
+mvx_encoder = env.Program('mvx_encoder', ['mvx_encoder.cpp', player], LIBS = libs)
+env.Install(env['BIN_DIR'], mvx_encoder)
+
+mvx_info = env.Program('mvx_info', ['mvx_info.cpp', player], LIBS = libs)
+env.Install(env['BIN_DIR'], mvx_info)
