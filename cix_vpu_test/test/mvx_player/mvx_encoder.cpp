@@ -222,6 +222,7 @@ int main(int argc, const char *argv[])
     uint32_t width, height;
     const char *roi_file = NULL;
     const char *epr_file = NULL;
+    bool free_run = true;
     struct v4l2_osd_info osd_info;
     memset(&osd_info, 0, sizeof(struct v4l2_osd_info));
 
@@ -258,7 +259,8 @@ int main(int argc, const char *argv[])
     mvx_argp_add_opt(&argp, 'p', "profile", true, 1, "0", "Profile.");
     mvx_argp_add_opt(&argp, 't', "tier", true, 1, "0", "Tier.");
     mvx_argp_add_opt(&argp, 'l', "level", true, 1, "0", "Level.");
-    mvx_argp_add_opt(&argp, 'v', "fps", true, 1, "24", "Frame rate.");
+    mvx_argp_add_opt(&argp, 0, "fps_n", true, 1, "24", "Numerator of fps.");
+    mvx_argp_add_opt(&argp, 0, "fps_d", true, 1, "1",  "Denominator of fps.");
     mvx_argp_add_opt(&argp, 0, "ecm", true, 1, "1", "0 is CAVLC, 1 is CABAC");
     mvx_argp_add_opt(&argp, 0, "bitdepth", true, 1, "8", "Set other bitdepth,invalid value 8 | 10.used for 10bit source encode as 8bit");
     mvx_argp_add_opt(&argp, 'q', "fixedqp", true, 1, "20", "fixed QP for I P B frames. If it is combined with -x then the value will later be increased with 2.");
@@ -402,6 +404,7 @@ int main(int argc, const char *argv[])
     mvx_argp_add_opt(&argp, 0, "rewind_frames", true, 1, "0", "set input buffer count in each loop for cached mode to re-use buffer, which is no more than 32");
     mvx_argp_add_opt(&argp, 0, "prob", true, 1, "0", "probability update mode control in vp9: 0 is off, 1 is implicit, 2 is explicit");
     mvx_argp_add_opt(&argp, 'P', "priority", true, 1, "2", "Scheduling priority: 0: preemption, 1: high, 2: normal, 3: low");
+    mvx_argp_add_opt(&argp, 0, "freerun", true, 1, "1", "enable free run: 0: disable, 1: enable");
 
     ret = mvx_argp_parse(&argp, argc - 1, &argv[1]);
     width = mvx_argp_get_int(&argp, "width", 0);
@@ -410,6 +413,10 @@ int main(int argc, const char *argv[])
     {
         mvx_argp_help(&argp, argv[0]);
         return 1;
+    }
+
+    if (mvx_argp_is_set(&argp, "freerun")) {
+        free_run = (mvx_argp_get_int(&argp, "freerun", 0) == 0) ? false : true;
     }
 
     inputFormat = Codec::to4cc(mvx_argp_get(&argp, "inputformat", 0));
@@ -763,7 +770,8 @@ int main(int argc, const char *argv[])
         outputFile = new OutputIVF(os, outputFormat,
                                    mvx_argp_get_int(&argp, "width", 0),
                                    mvx_argp_get_int(&argp, "height", 0),
-                                   mvx_argp_get_int(&argp, "fps", 0),
+                                   mvx_argp_get_int(&argp, "fps_n", 0),
+                                   mvx_argp_get_int(&argp, "fps_d", 0),
                                    mvx_argp_get_int(&argp, "frames", 0));
     }
     else if (string(mvx_argp_get(&argp, "format", 0)).compare("raw") == 0)
@@ -837,7 +845,7 @@ int main(int argc, const char *argv[])
             return 1;
         }
     }
-    Encoder encoder(devName, *inputFile, *outputFile);
+    Encoder encoder(devName, *inputFile, *outputFile, free_run, (free_run==true)?true:false);
     if (mvx_argp_is_set(&argp, "trystop"))
     {
         encoder.tryStopCmd(true);
@@ -1062,10 +1070,13 @@ int main(int argc, const char *argv[])
     {
         encoder.setLevel(mvx_argp_get_int(&argp, "level", 0));
     }
-    if (mvx_argp_is_set(&argp, "fps"))
-    {
-        encoder.setFramerate(mvx_argp_get_int(&argp, "fps", 0) << 16);
-        /* encoder.setFramerate(mvx_argp_get_int(&argp, "fps", 0)); */
+    if (1) {
+        /* we have default value,and must set framerate */
+        unsigned int fps_n = mvx_argp_get_int(&argp, "fps_n", 0);
+        unsigned int fps_d = mvx_argp_get_int(&argp, "fps_d", 0);
+        encoder.setFramerate(fps_n, fps_d);
+        if (free_run == false)
+            inputFile->setFrameRate(fps_n, fps_d);
     }
     if (mvx_argp_is_set(&argp, "bitdepth"))
     {

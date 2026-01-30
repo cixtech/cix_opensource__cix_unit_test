@@ -483,8 +483,13 @@ int main(int argc, const char *argv[])
         assert(inputFormat == Codec::to4cc("h264") || inputFormat == Codec::to4cc("hevc"));
         decoder.setSecureVideo();
         decoder.setNaluFormat(V4L2_OPT_NALU_FORMAT_START_CODES);
-        inputFile->setSecureVideo();
-        output->setSecureVideo();
+#ifdef ENABLE_DRM
+        inputFile->setSecureVideo(static_cast<void *>(decoder.secvid_session));
+        output->setSecureVideo(static_cast<void *>(decoder.secvid_session));
+#else
+        inputFile->setSecureVideo(NULL);
+        output->setSecureVideo(NULL);
+#endif
     }
     if (mvx_argp_is_set(&argp, "zero_out") && mvx_argp_get_int(&argp, "zero_out", 0) != 0) {
         decoder.setZeroOutAfbc();

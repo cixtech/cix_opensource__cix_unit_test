@@ -68,6 +68,11 @@
 #ifdef ENABLE_CPIPE
 #include "cix_pipe_types.h"
 #endif
+#ifdef ENABLE_DRM
+extern "C" {
+#include "cix_secvid_ca_api.h"
+}
+#endif
 
 #include "reader/read_util.h"
 #include "reader/parser.h"
@@ -351,7 +356,7 @@ class IVFHeader
 {
 public:
     IVFHeader();
-    IVFHeader(uint32_t codec, uint16_t width, uint16_t height, uint32_t frameRate, uint32_t frameCount);
+    IVFHeader(uint32_t codec, uint16_t width, uint16_t height, uint32_t fps_n, uint32_t fps_d,uint32_t frameCount);
 
     uint32_t signature;
     uint16_t version;
@@ -472,6 +477,7 @@ public:
 #endif
     virtual bool isExtInput() {return false;}
     virtual bool isSkipRead() {return false;}
+    virtual void setSecureVideo(void *data) {securevideo = true;}
 
     uint32_t getFormat() const { return format; }
     uint8_t getProfile() const { return profile; }
@@ -485,10 +491,10 @@ public:
     size_t getReadHeight() const { return readHeight;}
     void setRotation(int rot) {rotation = rot;}
     int getRotation() {return rotation;}
-    void setSecureVideo() {securevideo = true;}
     void setConvert10bit() {convert10bit = true;}
 
 protected:
+    void controlFrameRate(unsigned int fps_n, unsigned int fps_d);
     uint32_t format;
     uint8_t profile;
     size_t width;
@@ -499,6 +505,9 @@ protected:
     int rotation;
     bool securevideo;
     bool convert10bit;
+    unsigned int timestamp;
+    struct timeval base;
+    unsigned int count;
 };
 
 struct RateControlParams
@@ -520,11 +529,16 @@ public:
     virtual void finalize(Buffer &buf) {}
     virtual void setNaluFormat(int nalu){}
     virtual int getNaluFormat(){return 0;}
+    void setFrameRate(unsigned int fps_num, unsigned int fps_den);
 #ifdef ENABLE_CPIPE
     virtual void setExtInput(CpipeHandle cpipe) {}
 #endif
     std::queue<int> idr_list;
     std::queue<size_t> frame_bytes;
+protected:
+    void controlFrameRate();
+    unsigned int fps_n;
+    unsigned int fps_d;
 };
 
 class InputFile :
@@ -548,6 +562,12 @@ public:
     virtual bool isExtInput() {return cpipe != NULL;}
 #endif
     virtual bool isSkipRead() {return skipRead;}
+    virtual void setSecureVideo(void *data);
+
+#ifdef ENABLE_DRM
+    struct cix_secvid_session *secvid_session;
+#endif
+
 protected:
     InputFile(std::istream &input, uint32_t format, size_t width, size_t height, size_t strideAlign);
     void getExtBuffer(Buffer &buf, std::vector<iovec> &iov);
@@ -571,6 +591,9 @@ protected:
 #ifdef ENABLE_CPIPE
     CpipeHandle cpipe;
 #endif
+    int encrypted_buffer_fd;
+    size_t encrypted_buffer_len;
+    char* encrypted_buffer;
 };
 
 class InputIVF :
@@ -759,18 +782,22 @@ public:
     virtual void write(void *ptr, size_t nbytes) {}
     void setFrameRate(unsigned int fps_num, unsigned int fps_den);
     void setSkipOutput();
+    virtual void setSecureVideo(void *data);
+    virtual void secureVideoFinalize(Buffer &buf);
     std::queue<struct RateControlParams> drc_list;
 
 protected:
     void controlFrameRate();
-    unsigned int timestamp;
     size_t totalSize;
     bool packed;
-    struct timeval base;
     unsigned int count;
     unsigned int fps_n;
     unsigned int fps_d;
     bool skipOutput = false;
+
+#ifdef ENABLE_DRM
+    struct cix_secvid_session *secvid_session;
+#endif
 };
 
 class InputFileLayer
@@ -848,7 +875,7 @@ class OutputIVF :
     public OutputFile
 {
 public:
-    OutputIVF(std::ofstream &output, uint32_t format, uint16_t width, uint16_t height, uint32_t frameRate, uint32_t frameCount);
+    OutputIVF(std::ofstream &output, uint32_t format, uint16_t width, uint16_t height, uint32_t fps_n, uint32_t fps_d, uint32_t frameCount);
 
     virtual void finalize(Buffer &buf);
 
@@ -903,14 +930,16 @@ public:
           enum v4l2_buf_type inputType,
           enum v4l2_buf_type outputType,
           std::ostream &log,
-          bool nonblock);
+          bool nonblock,
+          bool freerun);
     Codec(const char *dev,
           Input &input,
           enum v4l2_buf_type inputType,
           Output &output,
           enum v4l2_buf_type outputType,
           std::ostream &log,
-          bool nonblock);
+          bool nonblock,
+          bool freerun);
     virtual ~Codec();
 
     int stream();
@@ -950,7 +979,8 @@ protected:
     class Port
     {
     public:
-        Port(int &fd, enum v4l2_buf_type type, std::ostream &log) :
+        Port(Codec* codec, int &fd, enum v4l2_buf_type type, std::ostream &log) :
+            owner(codec),
             fd(fd),
             type(type),
             log(log),
@@ -976,7 +1006,8 @@ protected:
         {memset(__stride, 0, sizeof(size_t) * VIDEO_MAX_PLANES);
         memset(&seamless,0,sizeof(seamless));
         memset(&crop,0,sizeof(crop));}
-        Port(int &fd, IO &io, v4l2_buf_type type, std::ostream &log) :
+        Port(Codec* codec, int &fd, IO &io, v4l2_buf_type type, std::ostream &log) :
+            owner(codec),
             fd(fd),
             io(&io),
             type(type),
@@ -1039,7 +1070,7 @@ protected:
         void setH264DecIntBufSize(uint32_t ibs);
         void setNALU(NaluFormat nalu);
         size_t getCaptureSize();
-        void setEncFramerate(uint32_t fps);
+        void setEncFramerate(unsigned int fps_n, unsigned int fps_d);
         void setEncBitrate(uint32_t bps);
         void setEncGOPSize(uint32_t gopSize);
         void setEncBFrames(uint32_t bframes);
@@ -1170,6 +1201,7 @@ protected:
         void enableDSLFrame();
         void enableEncCrop();
         void setEncLambdaScale(struct v4l2_mvx_lambda_scale *lambda_scale);
+        Codec* owner;
         int &fd;
         IO *io;
         v4l2_buf_type type;
@@ -1230,13 +1262,19 @@ protected:
     int fd;
     std::ostream &log;
     bool csweo;
-    uint32_t fps;
+    uint32_t fps_n;
+    uint32_t fps_d;
     uint32_t bps;
     uint32_t minqp;
     uint32_t maxqp;
     uint32_t fixedqp;
     uint32_t mini_frame_cnt;
     enum v4l2_memory memory_type;
+    std::queue<uint64_t> bufInQueue;
+    uint64_t max_process_time;
+    uint64_t min_process_time;
+    uint64_t avg_process_time;
+    volatile bool outputThreadDone;
 #ifdef ENABLE_CPIPE
     CpipeHandle cpipe;
 #endif
@@ -1270,12 +1308,13 @@ private:
     virtual void seek() {};
 
     bool nonblock;
+    bool freerun;
 };
 
 class Uevent
 {
 public:
-    Uevent(void *buf, int size);
+    Uevent(void *buf, int size, void *data);
     int getAction() {return action;}
     char *getDevPath() {return devpath;}
     char *getSubsystem() {return subsystem;}
@@ -1283,8 +1322,9 @@ public:
     int processEvent();
     int loadFirmware();
     int allocMemory(const char *region, size_t size);
-    int sendFirmware(int fd);
+    int sendFirmware();
     int sendMemory(int fd);
+    int ackInitHw(int done);
 
 private:
     int parseEvent(void *buf, int size);
@@ -1296,6 +1336,7 @@ private:
 #define UEVENT_TYPE_UNKNOWN 0
 #define UEVENT_TYPE_FIRMWARE 1
 #define UEVENT_TYPE_MEMORY 2
+#define UEVENT_TYPE_HARDWARE 3
     int type;
     union uevent_msg
     {
@@ -1340,14 +1381,22 @@ private:
             uint32_t major;
             uint32_t minor;
         } protocol;
-    };
+    } fw_desc;
 
     struct MemoryProtocol
     {
         int32_t fd;
     };
+
+    struct HardwareProtocol
+    {
+        int32_t done;
+    };
 #pragma pack(pop)
 
+#ifdef ENABLE_DRM
+    struct cix_secvid_session *secvid_session;
+#endif
 };
 
 class Decoder :
@@ -1360,7 +1409,7 @@ class Decoder :
     };
     typedef std::queue<struct SeekPoint> SeekQueue;
 public:
-    Decoder(const char *dev, Input &input, Output &output, bool nonblock = true, std::ostream &log = std::cout);
+    Decoder(const char *dev, Input &input, Output &output, bool freerun=true, bool nonblock = true, std::ostream &log = std::cout);
     virtual ~Decoder();
     void setH264IntBufSize(uint32_t ibs);
     void setInterlaced(bool interlaced);
@@ -1391,6 +1440,10 @@ public:
     int openUeventSocket();
     void addSeekPoint(int from_frame, int to_offset);
     virtual void seek();
+
+#ifdef ENABLE_DRM
+    struct cix_secvid_session *secvid_session = NULL;
+#endif
 private:
     int naluFmt;
     pthread_t tid;
@@ -1405,9 +1458,9 @@ class Encoder :
     public Codec
 {
 public:
-    Encoder(const char *dev, Input &input, Output &output, bool nonblock = true, std::ostream &log = std::cout);
+    Encoder(const char *dev, Input &input, Output &output, bool freerun, bool nonblock = true, std::ostream &log = std::cout);
     void changeSWEO(uint32_t csweo);
-    void setFramerate(uint32_t fps);
+    void setFramerate(unsigned int fps_n, unsigned int fps_d);
     void setBitrate(uint32_t bps);
     void setGOPSize(uint32_t gopSize);
     void setBFrames(uint32_t bframes);

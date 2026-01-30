@@ -10,6 +10,13 @@ if 'PATH_OUT' in os.environ:
 player = env.Object('mvx_player.cpp')
 libs = ['mvxutils']
 
+if 'CIX_DRM_ENABLE' in os.environ:
+    env.Append(CPPPATH = [os.path.join(os.environ['TEEC_EXPORT'].strip(), 'include')])
+    env.Append(LIBPATH = [os.path.join(os.environ['TEEC_EXPORT'].strip(), 'lib')])
+    libs.append('teec')
+    libs.append('cix_secvid_ca')
+    env.Append(CCFLAGS = ['-DENABLE_DRM'])
+
 mvx_decoder = env.Program('mvx_decoder', ['mvx_decoder.cpp', player], LIBS = libs)
 env.Install(env['BIN_DIR'], mvx_decoder)
 

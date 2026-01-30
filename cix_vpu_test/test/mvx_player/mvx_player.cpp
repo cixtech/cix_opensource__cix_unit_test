@@ -123,6 +123,18 @@ static T roundUp(T value, U round)
     return divRoundUp(value, round) * round;
 }
 
+static uint64_t getRawTick(void)
+{
+    struct timespec tv;
+    uint64_t tm;
+
+    clock_gettime(CLOCK_MONOTONIC_RAW, &tv);
+
+    tm = (uint64_t)tv.tv_sec * (1000000000L) + tv.tv_nsec;
+
+    return tm;
+}
+
 /****************************************************************************
  * Exception
  ****************************************************************************/
@@ -164,7 +176,6 @@ static sem_t m_sem_uevent_monitor;
 static char cfg_file_line_buf[CFG_FILE_LINE_SIZE];
 //static int startcode_find_candidate(char *buf, int size);
 
-
 #ifdef ENABLE_DISPLAY
 static struct video_format pix_drm_formats[] = {
     {V4L2_PIX_FMT_YUV420,           DRM_FORMAT_YUV420,      1},
@@ -205,15 +216,15 @@ IVFHeader::IVFHeader() :
     padding(0)
 {}
 
-IVFHeader::IVFHeader(uint32_t codec, uint16_t width, uint16_t height, uint32_t frameRate, uint32_t frameCount) :
+IVFHeader::IVFHeader(uint32_t codec, uint16_t width, uint16_t height, uint32_t fps_n, uint32_t fps_d, uint32_t frameCount) :
     signature(signatureDKIF),
     version(0),
     length(32),
     codec(codec),
     width(width),
     height(height),
-    frameRate(frameRate << 16),
-    timeScale(1 << 16),
+    frameRate(fps_n << 16),
+    timeScale(fps_d << 16),
     frameCount(frameCount),
     padding(0)
 {}
@@ -376,8 +387,49 @@ IO::IO(uint32_t format, size_t width, size_t height, size_t strideAlign) :
     height(height),
     strideAlign(strideAlign),
     securevideo(false),
-    convert10bit(false)
+    convert10bit(false),
+    timestamp(0),
+    base({0, 0}),
+    count(0)
 {}
+
+void IO::controlFrameRate(unsigned int fps_n, unsigned int fps_d)
+{
+    if (fps_n == 0)
+        return;
+
+   if (!timerisset(&base))
+    {
+        /* Skip the 1st frame's control, just record time base */
+        gettimeofday(&base, NULL);
+        count++;
+        return;
+    }
+
+    struct timeval next, now, d, t;
+    d.tv_sec = ((time_t)count * fps_d / fps_n);
+    d.tv_usec = (((time_t)count * fps_d % fps_n) * 1000000 / fps_n);
+    timeradd(&base, &d, &next);
+
+    gettimeofday(&now, NULL);
+    if (timercmp(&now, &next, <))
+    {
+        timersub(&next, &now, &t);
+        usleep(t.tv_sec * 1000000 + t.tv_usec);
+    }
+    else
+    {
+        timersub(&now, &next, &t);
+        if (dir == 0)
+            fprintf(stderr, "WARNING: Skip frame %d... input IO is %ld.%06ld ms late.\n",
+                count, t.tv_sec + (t.tv_usec/1000), t.tv_usec % 1000);
+        else
+            fprintf(stderr, "WARNING: Skip frame %d... output IO is %ld.%06ld ms late.\n",
+                count, t.tv_sec + (t.tv_usec/1000), t.tv_usec % 1000);
+    }
+
+    count++;
+}
 
 Input::Input(uint32_t format, size_t width, size_t height, size_t strideAlign) :
     IO(format, width, height, strideAlign)
@@ -387,6 +439,20 @@ Input::Input(uint32_t format, size_t width, size_t height, size_t strideAlign) :
         profile = 12;
     }
     dir = 0;
+}
+
+void Input::setFrameRate(unsigned int fps_n, unsigned int fps_d)
+{
+    if (fps_d > 0)
+    {
+        this->fps_n = fps_n;
+        this->fps_d = fps_d;
+    }
+}
+
+void Input::controlFrameRate()
+{
+    IO::controlFrameRate(fps_n, fps_d);
 }
 
 InputFile::InputFile(istream &input, uint32_t format) :
@@ -436,6 +502,10 @@ InputFile::~InputFile()
     }
     if (reader) {
         delete reader;
+    }
+    if (encrypted_buffer) {
+        munmap(encrypted_buffer, encrypted_buffer_len);
+        close(encrypted_buffer_fd);
     }
 }
 
@@ -544,6 +614,26 @@ void InputFile::prepare(Buffer &buf)
             buf.setBytesUsed(iov);
         }
     } else {
+#ifdef ENABLE_DRM
+        size_t read_len = min(encrypted_buffer_len, iov[0].iov_len);
+        input.read(encrypted_buffer, read_len);
+        read_len = input.gcount();
+        struct decrypt_data_params stream_desc;
+        stream_desc.enc_fd = encrypted_buffer_fd;
+        stream_desc.enc_len = read_len;
+        stream_desc.dec_fd = buf.getDmaFd(0);
+        stream_desc.dec_len = iov[0].iov_len;
+        int ret = cix_secvid_send_command(secvid_session, CIX_CA_CMD_SECVID_DECRYPT_DATA, &stream_desc);
+        if (ret != OK) {
+            throw Exception("Decrypt bitstream failed: %d.", ret);
+        }
+        iov[0].iov_len = stream_desc.dec_used;
+        buf.setBytesUsed(iov);
+        printf("Decrypt bitstream, enc_fd=%d, enc_len=%ld, dec_fd=%d, dec_len=%ld, dec_used=%ld\n",
+                stream_desc.enc_fd, stream_desc.enc_len,
+                stream_desc.dec_fd, stream_desc.dec_len,
+                stream_desc.dec_used);
+#else
         /*
          * In secure video case, should communicate with TA in OP-TEE to
          * load input bitstream. Before OP-TEE is up, just set bytesused
@@ -551,6 +641,7 @@ void InputFile::prepare(Buffer &buf)
          */
         buf.setBytesUsed(iov);
         iseof = true;
+#endif
     }
 
     if (rewind && input.peek() == EOF) {
@@ -578,6 +669,37 @@ bool InputFile::eof()
 {
     //return input.peek() == EOF;
     return iseof;
+}
+
+void InputFile::setSecureVideo(void *data)
+{
+    securevideo = true;
+
+#ifdef ENABLE_DRM
+    encrypted_buffer_len = SIZE_4M;
+    secvid_session = static_cast<struct cix_secvid_session*>(data);
+
+    int fd = open(DMA_HEAP_SYSTEM, O_RDWR);
+    if (fd < 0)
+    {
+        throw Exception("Failed to open ion device.");
+    }
+
+    struct dma_heap_allocation_data heap_data {
+        .len = encrypted_buffer_len,
+        .fd_flags = O_RDWR | O_CLOEXEC,
+    };
+    if (ioctl(fd, DMA_HEAP_IOCTL_ALLOC, &heap_data) < 0)
+    {
+        throw Exception("DMA_HEAP_IOCTL_ALLOC failed. errno=%d (%s).", errno, strerror(errno));
+    }
+
+    close(fd);
+    encrypted_buffer_fd = heap_data.fd;
+    encrypted_buffer = (char*)mmap(NULL, encrypted_buffer_len,
+                                PROT_READ | PROT_WRITE, MAP_SHARED,
+                                encrypted_buffer_fd, 0);
+#endif
 }
 
 InputIVF::InputIVF(istream &input, uint32_t informat) :
@@ -1033,6 +1155,7 @@ void InputFileFrame::prepare(Buffer &buf)
         skipRead = true;
     }
     buf.setTimeStamp(prepared_frames);
+    Input::controlFrameRate();
 }
 
 InputFileMiniFrame::InputFileMiniFrame(std :: istream & input, uint32_t format, size_t width, size_t height,
@@ -2197,10 +2320,7 @@ void InputFrame::rgb2yuv(unsigned int yuv[3], const unsigned int rgb[3])
 
 Output::Output(uint32_t format) :
     IO(format),
-    timestamp(0),
     totalSize(0),
-    base({0, 0}),
-    count(0),
     fps_n(0),
     fps_d(1)
 {
@@ -2210,11 +2330,8 @@ Output::Output(uint32_t format) :
 
 Output::Output(uint32_t format, bool packed) :
     IO(format),
-    timestamp(0),
     totalSize(0),
     packed(packed),
-    base({0, 0}),
-    count(0),
     fps_n(0),
     fps_d(1)
 {
@@ -2308,8 +2425,13 @@ void Output::finalize(Buffer &buf)
     }
     timestamp = b.timestamp.tv_usec;
 
-    if (securevideo || skipOutput)
+    if (skipOutput)
         return;
+
+    if (securevideo) {
+        secureVideoFinalize(buf);
+        return;
+    }
 
     vector<iovec> iov;
     vector<char> img_buf;
@@ -2357,12 +2479,50 @@ void Output::finalize(Buffer &buf)
 
 }
 
-void Output::setFrameRate(unsigned int numerator, unsigned int denominator)
+void Output::secureVideoFinalize(Buffer &buf)
 {
-    if (denominator > 0)
+#ifdef ENABLE_DRM
+    vector<iovec> iov;
+    vector<char> img_buf;
+    struct dump_data_params params;
+    int fd;
+    size_t length;
+    v4l2_buffer &b = buf.getBuffer();
+
+    iov = buf.getBytesUsed();
+    for (size_t i = 0; i < iov.size(); ++i)
     {
-        fps_n = numerator;
-        fps_d = denominator;
+        if (V4L2_TYPE_IS_MULTIPLANAR(b.type))
+            fd = b.m.planes[i].m.fd;
+        else
+            fd = b.m.fd;
+        length = iov[i].iov_len;
+        img_buf.resize(length);
+        params.src_fd = fd;
+        params.dst_virt = (uint8_t *)(&img_buf[0]);
+        params.length = &length;
+        int ret = cix_secvid_send_command(secvid_session, CIX_CA_CMD_SECVID_DUMP_DATA, &params);
+        if (ret != OK) {
+            printf("Dump protected data is not allowed\n");
+            return;
+        }
+        if (length != iov[i].iov_len) {
+            printf("Warning: dump protected data length is incorrect, expected %zu, actually %zu\n",
+                    iov[i].iov_len, length);
+            return;
+        }
+        write((void *)(&img_buf[0]), iov[i].iov_len);
+        totalSize += iov[i].iov_len;
+    }
+#endif
+}
+
+void Output::setFrameRate(unsigned int fps_n, unsigned int fps_d)
+{
+    if (fps_d > 0)
+    {
+        this->fps_n = fps_n;
+        this->fps_d = fps_d;
     }
 }
 
@@ -2373,36 +2533,16 @@ void Output::setSkipOutput()
 
 void Output::controlFrameRate()
 {
-    if (fps_n == 0)
-        return;
+    IO::controlFrameRate(fps_n, fps_d);
+}
 
-    if (!timerisset(&base))
-    {
-        /* Skip the 1st frame's control, just record time base */
-        gettimeofday(&base, NULL);
-        count++;
-        return;
-    }
+void Output::setSecureVideo(void *data)
+{
+    securevideo = true;
 
-    struct timeval next, now, d, t;
-    d.tv_sec = ((time_t)count * fps_d / fps_n);
-    d.tv_usec = (((time_t)count * fps_d % fps_n) * 1000000 / fps_n);
-    timeradd(&base, &d, &next);
-
-    gettimeofday(&now, NULL);
-    if (timercmp(&now, &next, <))
-    {
-        timersub(&next, &now, &t);
-        usleep(t.tv_sec * 1000000 + t.tv_usec);
-    }
-    else
-    {
-        timersub(&now, &next, &t);
-        fprintf(stderr, "WARNING: Skip frame %d... decode output is %ld.%06ld ms late.\n",
-            count, t.tv_sec + (t.tv_usec/1000), t.tv_usec % 1000);
-    }
-
-    count++;
+#ifdef ENABLE_DRM
+    secvid_session = static_cast<struct cix_secvid_session*>(data);
+#endif
 }
 
 OutputFile::OutputFile(ostream &output, uint32_t format) :
@@ -2637,11 +2777,12 @@ OutputIVF::OutputIVF(ofstream &output,
                      uint32_t format,
                      uint16_t width,
                      uint16_t height,
-                     uint32_t frameRate,
+                     uint32_t fps_n,
+                     uint32_t fps_d,
                      uint32_t frameCount) :
     OutputFile(output, format)
 {
-    IVFHeader header(format, width, height, frameRate, frameCount);
+    IVFHeader header(format, width, height, fps_n, fps_d, frameCount);
     write(reinterpret_cast<char *>(&header), sizeof(header));
 }
 
@@ -2700,8 +2841,10 @@ void OutputAFBC::finalize(Buffer &buf)
         return;
     }
 
-    if (securevideo)
+    if (securevideo) {
+        secureVideoFinalize(buf);
         return;
+    }
 
     tiled = ((b.flags & V4L2_BUF_FLAG_MVX_AFBC_TILED_HEADERS) || (b.flags & V4L2_BUF_FLAG_MVX_AFBC_TILED_BODY)) ? true : false;
 
@@ -3690,18 +3833,24 @@ Codec::Codec(const char *dev,
              enum v4l2_buf_type inputType,
              enum v4l2_buf_type outputType,
              ostream &log,
-             bool nonblock) :
-    input(fd, inputType, log),
-    output(fd, outputType, log),
+             bool nonblock,
+             bool freerun) :
+    input(this, fd, inputType, log),
+    output(this, fd, outputType, log),
     log(log),
 #ifdef ENABLE_CPIPE
     cpipe(NULL),
 #endif
-    nonblock(nonblock)
+    nonblock(nonblock),
+    freerun(freerun),
+    outputThreadDone(false)
 {
     openDev(dev);
     mini_frame_cnt = 0;
     memory_type = V4L2_MEMORY_MMAP;
+    max_process_time = 0;
+    min_process_time = 0xffffffff;
+    avg_process_time = 0;
 }
 
 Codec::Codec(const char *dev,
@@ -3710,12 +3859,14 @@ Codec::Codec(const char *dev,
              Output &output,
              enum v4l2_buf_type outputType,
              ostream &log,
-             bool nonblock) :
-    input(fd, input, inputType, log),
-    output(fd, output, outputType, log),
+             bool nonblock,
+             bool freerun) :
+    input(this, fd, input, inputType, log),
+    output(this, fd, output, outputType, log),
     log(log),
     csweo(false),
-    fps(0),
+    fps_n(0),
+    fps_d(1),
     bps(0),
     minqp(0),
     maxqp(0),
@@ -3723,11 +3874,16 @@ Codec::Codec(const char *dev,
 #ifdef ENABLE_CPIPE
     cpipe(NULL),
 #endif
-    nonblock(nonblock)
+    nonblock(nonblock),
+    freerun(freerun),
+    outputThreadDone(false)
 {
     openDev(dev);
     mini_frame_cnt = 0;
     memory_type = V4L2_MEMORY_MMAP;
+    max_process_time = 0;
+    min_process_time = 0xffffffff;
+    avg_process_time = 0;
 }
 
 Codec::~Codec()
@@ -4706,7 +4862,10 @@ void Codec::allocateBuffers(enum v4l2_memory m_type)
     //0 is default value, let port handle buffer cnt
     // Set buffer count as 1 for jpeg encode to avoid mmap failure
     size_t default_buffer_cnt = (output.io->getFormat() == V4L2_PIX_FMT_JPEG || output.io->getFormat() == V4L2_PIX_FMT_MJPEG)? 1 : 6;
-    input.allocateBuffers(mini_frame_cnt >= 2? mini_frame_cnt : input.getBufferCnt() ? input.getBufferCnt() : default_buffer_cnt, m_type);
+    size_t count = mini_frame_cnt >= 2? mini_frame_cnt : input.getBufferCnt() ? input.getBufferCnt() : default_buffer_cnt;
+    if (freerun == false)
+        count = 1;
+    input.allocateBuffers(count, m_type);
     output.allocateBuffers(output.getBufferCnt()? output.getBufferCnt() : default_buffer_cnt, m_type);
 }
 
@@ -5160,7 +5319,7 @@ void Codec::Port::queueBuffer(Buffer &buf)
                 if (rc.target_bit_rate > 0)
                     setEncBitrate(rc.target_bit_rate);
                 if (rc.frame_rate > 0)
-                    setEncFramerate(rc.frame_rate << 16);
+                    setEncFramerate(rc.frame_rate, 1);
                 if (rc.minqp < 1000)
                     setEncMinQP(rc.minqp);
                 if (rc.maxqp < 1000)
@@ -5189,6 +5348,10 @@ void Codec::Port::queueBuffer(Buffer &buf)
 
     buf.setInQueue(true);
     ++pending;
+    if (io->getDir() == 0 && V4L2_TYPE_IS_MULTIPLANAR(b.type) && owner->freerun == false) {
+        uint64_t tick = getRawTick();
+        owner->bufInQueue.push(tick);
+    }
 }
 
 Buffer &Codec::Port::dequeueBuffer()
@@ -5202,7 +5365,6 @@ Buffer &Codec::Port::dequeueBuffer()
     buf.type = type;
     buf.memory = memory_type_port;
     buf.length = 3;
-
 
     do {
         ret = ioctl(fd, VIDIOC_DQBUF, &buf);
@@ -5220,6 +5382,15 @@ Buffer &Codec::Port::dequeueBuffer()
                         buf.type, buf.memory, errno);
     }
 
+    if(io->getDir() == 1) {
+        if (!owner->bufInQueue.empty()) {
+            uint64_t process_time = getRawTick() - owner->bufInQueue.front();
+            owner->bufInQueue.pop();
+            owner->avg_process_time += process_time;
+            owner->max_process_time = (process_time > owner->max_process_time) ? process_time : owner->max_process_time;
+            owner->min_process_time = (process_time < owner->min_process_time) ? process_time : owner->min_process_time;
+        }
+    }
     --pending;
     printBuffer(buf, "<-");
 
@@ -5332,8 +5503,13 @@ void Codec::Port::streamon()
 
 void Codec::streamoff()
 {
+    int process_frames = output.getFramesProcessed();
     input.streamoff();
     output.streamoff();
+    if (process_frames && avg_process_time) {
+        avg_process_time /= process_frames;
+        printf("avg encoding delay is %ld.%ld us\n",avg_process_time/1000,avg_process_time%1000);
+    }
 }
 
 void Codec::Port::streamoff()
@@ -5457,20 +5633,20 @@ size_t Codec::Port::getCaptureSize()
     return baseSize;
 }
 
-void Codec::Port::setEncFramerate(uint32_t frame_rate)
+void Codec::Port::setEncFramerate(unsigned int fps_n, unsigned int fps_d)
 {
-    log << "setEncFramerate( " << frame_rate << " )" << endl;
+    log << "setEncFramerate( " << fps_n << "/" << fps_d << " )" << endl;
 
     struct v4l2_streamparm streamparm;
 
     memset (&streamparm, 0x00, sizeof (struct v4l2_streamparm));
     streamparm.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-    streamparm.parm.output.timeperframe.numerator = (1 << 16);
-    streamparm.parm.output.timeperframe.denominator = frame_rate;
+    streamparm.parm.output.timeperframe.numerator = fps_d;
+    streamparm.parm.output.timeperframe.denominator = fps_n;
 
     if (-1 == ioctl(fd, VIDIOC_S_PARM, &streamparm))
     {
-        throw Exception("Failed to set frame_rate=%u.", frame_rate);
+        throw Exception("Failed to set frame_rate=%u/%u.", fps_n,fps_d);
     }
 }
 
@@ -7373,10 +7549,10 @@ void Codec::runPoll()
             if (csweo)
             {
                 log << "Changing settings while encoding." << endl;
-                if (fps != 0)
+                if (fps_n != 0 && fps_d !=0)
                 {
-                    output.setEncFramerate(fps);
-                    fps = 0;
+                    output.setEncFramerate(fps_n, fps_d);
+                    fps_n = fps_d = 0;
                 }
                 if (bps != 0)
                 {
@@ -7440,7 +7616,7 @@ void *Codec::runThreadInput(void *arg)
     Codec *_this = static_cast<Codec *>(arg);
     bool eos = false;
 
-    while (!eos)
+    while (!eos && _this->outputThreadDone == false)
         eos = _this->input.handleBuffer();
 
     return NULL;
@@ -7453,6 +7629,8 @@ void *Codec::runThreadOutput(void *arg)
 
     while (!eos)
         eos = _this->output.handleBuffer();
+
+    _this->outputThreadDone = true;
 
     return NULL;
 }
@@ -7495,9 +7673,13 @@ bool Codec::Port::handleBuffer()
 
     /* Remove vendor custom flags. */
     //decoder specfied frames count to be processed
-    if (io->getDir() == 1 && V4L2_TYPE_IS_MULTIPLANAR(b.type)
-            && (b.flags & V4L2_BUF_FLAG_MVX_BUFFER_FRAME_PRESENT) == V4L2_BUF_FLAG_MVX_BUFFER_FRAME_PRESENT) {
-        frames_processed++;
+    if (io->getDir() == 1) {
+        if (V4L2_TYPE_IS_MULTIPLANAR(b.type)) {
+            if ((b.flags & V4L2_BUF_FLAG_MVX_BUFFER_FRAME_PRESENT) == V4L2_BUF_FLAG_MVX_BUFFER_FRAME_PRESENT)
+                frames_processed++;
+        } else {
+            frames_processed++;
+        }
     }
     buffer.resetVendorFlags();
     if (io->getDir() == 1 && frames_count > 0 && frames_processed >= frames_count) {
@@ -7828,8 +8010,11 @@ size_t Codec::getSize(uint32_t format, size_t width, size_t height,
     return frameSize;
 }
 
-Uevent::Uevent(void *buf, int size)
+Uevent::Uevent(void *buf, int size, void *data)
 {
+#ifdef ENABLE_DRM
+    secvid_session = static_cast<struct cix_secvid_session *>(data);
+#endif
     parseEvent(buf, size);
 
     return;
@@ -7865,6 +8050,8 @@ int Uevent::parseEvent(void *buf, int size)
                 type = UEVENT_TYPE_FIRMWARE;
             else if (!strncmp(entry+5, "memory", 6))
                 type = UEVENT_TYPE_MEMORY;
+            else if (!strncmp(entry+5, "hardware", 8))
+                type = UEVENT_TYPE_HARDWARE;
         } else if (!strncmp(entry, "NUMCORES=", 9)) {
             msg.fw.numcores = atoi(entry+9);
         } else if (!strncmp(entry, "FIRMWARE=", 9)) {
@@ -7885,38 +8072,75 @@ int Uevent::processEvent()
     if (action != UEVENT_ACTION_ADD)
         return -1;
     if (type == UEVENT_TYPE_FIRMWARE) {
-        int fd = loadFirmware();
-        if (fd >= 0) {
-            sendFirmware(fd);
-        }
+        loadFirmware();
+        sendFirmware();
     } else if (type == UEVENT_TYPE_MEMORY) {
         const char *region = DMA_HEAP_PRIVATE;
         if (msg.mem.region == UEVENT_MEMORY_REGION_PROTECTED)
             region = DMA_HEAP_PROTECTED_INTBUF;
         else if (msg.mem.region == UEVENT_MEMORY_REGION_OUTBUF)
             region = DMA_HEAP_OUTBUF;
+        printf("UEVENT_TYPE_MEMORY %s\n", region);
         int fd = allocMemory(region, msg.mem.size);
         if (fd >= 0)
             sendMemory(fd);
+    } else if (type == UEVENT_TYPE_HARDWARE) {
+#ifdef ENABLE_DRM
+        printf("UEVENT_TYPE_HARDWARE\n");
+        int reslut;
+        int ret = cix_secvid_send_command(secvid_session, CIX_CA_CMD_SECVID_INIT_VPU_HW, &reslut);
+        if (ret != OK) {
+            throw Exception("Failed to load secure vpu firmware.");
+        } else {
+            int32_t done = reslut == 0 ? 1 : 0;
+            ackInitHw(done);
+        }
+#else
+        ackInitHw(1);
+#endif
     }
     return 0;
 }
 
 int Uevent::loadFirmware()
 {
+#ifdef ENABLE_DRM
+    struct mvx_secure_firmare sec_fw_desc;
+
+    memset(&sec_fw_desc, 0x0, sizeof(sec_fw_desc));
+    sec_fw_desc.cores = msg.fw.numcores;
+    strncpy(sec_fw_desc.name, msg.fw.firmware, sizeof(sec_fw_desc.name) - 1);
+    int ret = cix_secvid_send_command(secvid_session, CIX_CA_CMD_SECVID_LOAD_VPU_FW, &sec_fw_desc);
+    if (ret != OK) {
+        throw Exception("Failed to load secure vpu firmware.");
+    }
+
+    fw_desc.fd = sec_fw_desc.fd;
+    fw_desc.l2pages = sec_fw_desc.l2pages;
+    fw_desc.protocol.major = sec_fw_desc.protocol.major;
+    fw_desc.protocol.minor = sec_fw_desc.protocol.minor;
+
+    return 0;
+#else
     /* In secure decoding Phase I, decrypted firmware and its L2 page table
      * are loaded by backdoor, so just need to allocate a 4MB buffer from
      * private region and assume the data is already there */
-    int memfd = allocMemory(DMA_HEAP_PRIVATE, SIZE_4M);
+    fw_desc.fd = allocMemory(DMA_HEAP_PRIVATE, SIZE_4M);
+    /* Firmware L2 pages are located in the end of firmware buffer,
+     * one 4K page for each core */
+    fw_desc.l2pages = SECURE_DECODING_PHASE_I_FW_BASE + SIZE_4M -
+                    (msg.fw.numcores * MVE_PAGE_SIZE);
 
     /* Hardcode protocol version to 3.5 for now, just for secure decoding Phase I.
      * For Phase II, it should be from TA */
-    fw_hdr.protocol_major = 3;
-    fw_hdr.protocol_minor = 5;
+    fw_desc.protocol.major = 3;
+    fw_desc.protocol.minor = 5;
 
     /* Driver will call dma_buf_put() in secure_firmware_release()
      * to close memfd. */
-    return memfd;
+
+    return 0;
+#endif
 }
 
 int Uevent::allocMemory(const char *region, size_t size)
@@ -7942,17 +8166,8 @@ int Uevent::allocMemory(const char *region, size_t size)
     return heap_data.fd;
 }
 
-int Uevent::sendFirmware(int memfd)
+int Uevent::sendFirmware()
 {
-    struct FirmwareProtocol fw_desc;
-    fw_desc.fd = memfd;
-    /* Firmware L2 pages are located in the end of firmware buffer,
-     * one 4K page for each core */
-    fw_desc.l2pages = SECURE_DECODING_PHASE_I_FW_BASE + SIZE_4M -
-                    (msg.fw.numcores * MVE_PAGE_SIZE);
-    fw_desc.protocol.major = fw_hdr.protocol_major;
-    fw_desc.protocol.minor = fw_hdr.protocol_minor;
-
     char path[256];
     snprintf(path, sizeof(path), "/sys%s/firmware", devpath);
     int fd = open(path, O_WRONLY);
@@ -7981,9 +8196,24 @@ int Uevent::sendMemory(int dmafd)
     return 0;
 }
 
-Decoder::Decoder(const char *dev, Input &input, Output &output, bool nonblock, ostream &log) :
+int Uevent::ackInitHw(int done)
+{
+    struct HardwareProtocol hw = { .done = done };
+    char path[256];
+    snprintf(path, sizeof(path), "/sys%s/hardware", devpath);
+    int fd = open(path, O_WRONLY);
+    if (fd < 0)
+        return fd;
+    ssize_t n = write(fd, &hw, sizeof(hw));
+    if (n < (ssize_t)sizeof(hw))
+        cerr << "Error: Failed to send vpu initializion result" << endl;
+    close(fd);
+    return 0;
+}
+
+Decoder::Decoder(const char *dev, Input &input, Output &output, bool freerun, bool nonblock, ostream &log) :
     Codec(dev, input, V4L2_BUF_TYPE_VIDEO_OUTPUT, output,
-          V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, log, nonblock),
+          V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, log, nonblock, freerun),
     tid(0),
     sktfd(-1),
     eos(0)
@@ -7991,6 +8221,10 @@ Decoder::Decoder(const char *dev, Input &input, Output &output, bool nonblock, o
 
 Decoder::~Decoder()
 {
+#ifdef ENABLE_DRM
+    if (secvid_session)
+        cix_secvid_close_session(secvid_session);
+#endif
     if (sktfd >= 0) {
         eos = 1;
         pthread_join(tid, NULL);
@@ -8123,7 +8357,11 @@ void* Decoder::monitorUevent(void *arg)
         if (decoder->wait(WAIT_TIMEOUT_MS) <= 0)
             continue;
         if ((n = recv(sfd, msg, UEVENT_MSG_SIZE, 0)) > 0) {
-            Uevent uevent = Uevent(msg, n);
+#ifdef ENABLE_DRM
+            Uevent uevent = Uevent(msg, n, static_cast<void *>(decoder->secvid_session));
+#else
+            Uevent uevent = Uevent(msg, n, NULL);
+#endif
             uevent.processEvent();
         }
     }
@@ -8157,6 +8395,12 @@ void Decoder::setSecureVideo()
 
     input.setSecureVideo();
     output.setSecureVideo();
+
+#ifdef ENABLE_DRM
+    secvid_session = cix_secvid_open_session();
+    if (!secvid_session)
+        throw Exception("Failed to open secure video session.");
+#endif
 
     sem_wait(&m_sem_uevent_monitor);
     sem_destroy(&m_sem_uevent_monitor);
@@ -8252,9 +8496,9 @@ void Decoder::seek()
     }
 }
 
-Encoder::Encoder(const char *dev, Input &input, Output &output, bool nonblock, ostream &log) :
+Encoder::Encoder(const char *dev, Input &input, Output &output, bool freerun, bool nonblock, ostream &log) :
     Codec(dev, input, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, output,
-          V4L2_BUF_TYPE_VIDEO_CAPTURE, log, nonblock)
+          V4L2_BUF_TYPE_VIDEO_CAPTURE, log, nonblock, freerun)
 {
     //this->output.setEncFramerate(30 << 16);
     //this->output.setEncBitrate(input.getWidth() * input.getHeight() * 30 / 2);
@@ -8265,15 +8509,16 @@ void Encoder::changeSWEO(uint32_t csweo)
     this->csweo = (csweo == 1);
 }
 
-void Encoder::setFramerate(uint32_t fps)
+void Encoder::setFramerate(unsigned int fps_n, unsigned int fps_d)
 {
     if (!csweo)
     {
-        output.setEncFramerate(fps);
+        output.setEncFramerate(fps_n, fps_d);
     }
     else
     {
-        this->fps = fps;
+        this->fps_n = fps_n;
+        this->fps_d = fps_d;
     }
 }
 
@@ -8781,6 +9026,7 @@ Info::Info(const char *dev, ostream &log) :
           V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
           V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
           log,
+          true,
           true)
 {}
 
