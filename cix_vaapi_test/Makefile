@@ -6,35 +6,22 @@ FLAGS = -Wall -O2 -g $(INCLUDES) --sysroot=${PATH_SYSROOT}
 LDFLAGS = -L${PATH_SYSROOT}/usr/lib/aarch64-linux-gnu -ldrm -lva-drm -lva
 INCLUDES += -I. -I./common
 
-TARGETS = h264dec_vaapi_test hevcdec_vaapi_test
+TARGETS = h264dec_vaapi_test hevcdec_vaapi_test vp9dec_vaapi_test
 
-COMMON_DIR = common
-COMMON_SRCS = $(COMMON_DIR)/va_display.c $(COMMON_DIR)/bitstream.cpp \
-              $(COMMON_DIR)/dumpframe.cpp
-COMMON_OBJS = $(COMMON_SRCS:.c=.o)
-COMMON_OBJS := $(COMMON_OBJS:.cpp=.o)
-
-h264decode_SRCS	= h264decode.cpp
-hevcdecode_SRCS	= hevcdecode.cpp
-
-h264decode_OBJS = $(h264decode_SRCS:.cpp=.o)
-hevcdecode_OBJS = $(hevcdecode_SRCS:.cpp=.o)
+COMMON_SRCS := $(wildcard common/*.cpp)
 
 all: $(TARGETS)
 
-h264dec_vaapi_test: $(COMMON_OBJS) $(h264decode_OBJS)
-	$(CXX) $(FLAGS) -o $@ $^ $(LDFLAGS)
+h264dec_vaapi_test: $(COMMON_SRCS) h264decode.cpp
+	$(CXX) $(FLAGS) -o $@ $(COMMON_SRCS) h264decode.cpp $(LDFLAGS)
 
-hevcdec_vaapi_test: $(COMMON_OBJS) $(hevcdecode_OBJS)
-	$(CXX) $(FLAGS) -o $@ $^ $(LDFLAGS)
+hevcdec_vaapi_test: $(COMMON_SRCS) hevcdecode.cpp
+	$(CXX) $(FLAGS) -o $@ $(COMMON_SRCS) hevcdecode.cpp $(LDFLAGS)
 
-%.o: %.c
-	$(CC) $(FLAGS) -c -o $@ $<
-
-%.o: %.cpp
-	$(CXX) $(FLAGS) -c -o $@ $<
+vp9dec_vaapi_test: $(COMMON_SRCS) vp9decode.cpp
+	$(CXX) $(FLAGS) -o $@ $(COMMON_SRCS) vp9decode.cpp $(LDFLAGS)
 
 clean:
-	rm -f $(COMMON_OBJS) $(h264decode_OBJS) $(hevcdecode_OBJS) $(TARGETS)
+	rm -f $(TARGETS)
 
 .PHONY: all clean

@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Cix Technology Group Co., Ltd.
+ * Copyright 2026 Cix Technology Group Co., Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,13 +14,10 @@
  * limitations under the License.
  */
 
-#ifndef VA_DISPLAY_H
-#define VA_DISPLAY_H
+#ifndef __TEST_COSINE_SIM_H
+#define __TEST_COSINE_SIM_H
 
-#include <va/va.h>
-#include <stdio.h>
+/* cme_2d_cosine_sim — returns EXIT_SUCCESS or EXIT_FAILURE. */
+int test_cosine_sim(int argc, char** argv);
 
-VADisplay va_open_display(void);
-void va_close_display(VADisplay va_dpy);
-
-#endif /* VA_DISPLAY_H */
+#endif

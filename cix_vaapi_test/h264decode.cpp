@@ -20,7 +20,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <va/va.h>
-#include "common/va_display.h"
+#include "common/vadisplay.h"
 #include "common/bitstream.h"
 #include "common/dumpframe.h"
 #include "h264decode.h"
@@ -143,16 +143,26 @@ static int va_init(H264Decoder *decoder) {
     VAConfigAttrib attrib;
     VAStatus va_status;
 
-    VAProfile profile = VAProfileH264High;
+    VAProfile profile = (decoder->output_bit_depth == 10) ? VAProfileH264High10 : VAProfileH264High;
+    unsigned int rt_format = (decoder->output_bit_depth == 10) ? VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420;
     VAEntrypoint entrypoint = VAEntrypointVLD;
 
     if (decoder->initialized == 1) {
         return 0;
     }
 
+    attrib.type = VAConfigAttribRTFormat;
     va_status = vaGetConfigAttributes(decoder->va_dpy, profile, entrypoint, &attrib, 1);
     CHECK_VASTATUS(va_status, "vaGetConfigAttributes");
 
+    if ((attrib.value & rt_format) == 0) {
+        fprintf(stderr, "va_init: RT format 0x%x not supported for profile (mask 0x%x)\n",
+                rt_format, attrib.value);
+        return -1;
+    }
+
+    attrib.type = VAConfigAttribRTFormat;
+    attrib.value = rt_format;
     va_status = vaCreateConfig(decoder->va_dpy, profile, entrypoint,
                                &attrib, 1, &decoder->config_id);
     CHECK_VASTATUS(va_status, "vaCreateConfig");
@@ -162,7 +172,7 @@ static int va_init(H264Decoder *decoder) {
 
     va_status = vaCreateSurfaces(
                     decoder->va_dpy,
-                    VA_RT_FORMAT_YUV420, decoder->width, decoder->height,
+                    rt_format, decoder->width, decoder->height,
                     decoder->surfaces, decoder->surface_count,
                     NULL, 0
                 );
@@ -490,8 +500,7 @@ static int va_h264_parse_sequence(H264Decoder *decoder, uint8_t *sps_nal, int sp
     pic_param.pic_fields.bits.reference_pic_flag = (decoder->nal_ref_idc != 0);
     pic_param.frame_num = 0;
 
-    va_status = va_init(decoder);
-    if (decoder->initialized != 1) {
+    if (va_init(decoder) != 0 || decoder->initialized != 1) {
         fprintf(stderr, "va_init failed\n");
         return 1;
     }
@@ -540,26 +549,49 @@ int main(int argc, char **argv)
     VAStatus va_status;
     H264Decoder decoder;
     memset(&decoder, 0, sizeof(decoder));
+    decoder.output_bit_depth = 8;
+    const char *input_file = nullptr;
     const char *output_file = nullptr;
     FILE* file = nullptr;
 
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <h264_file>\n", argv[0]);
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-b") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "Usage: %s [-b 8|10] <h264_file> [output_file]\n", argv[0]);
+                return -1;
+            }
+            decoder.output_bit_depth = atoi(argv[i]);
+            if (decoder.output_bit_depth != 8 && decoder.output_bit_depth != 10) {
+                fprintf(stderr, "-b must be 8 or 10\n");
+                return -1;
+            }
+        } else if (!input_file) {
+            input_file = argv[i];
+        } else if (!output_file) {
+            output_file = argv[i];
+        } else {
+            fprintf(stderr, "Usage: %s [-b 8|10] <h264_file> [output_file]\n", argv[0]);
+            return -1;
+        }
+    }
+
+    if (!input_file) {
+        fprintf(stderr, "Usage: %s [-b 8|10] <h264_file> [output_file]\n", argv[0]);
         return -1;
     }
 
-    FILE* fp = fopen(argv[1], "rb");
+    FILE* fp = fopen(input_file, "rb");
     if (!fp) {
-        fprintf(stderr, "Failed to open file: %s\n", argv[1]);
+        fprintf(stderr, "Failed to open file: %s\n", input_file);
         return -1;
     }
 
-    if (argc == 3) {
-        printf("output_file: %s\n", argv[2]);
-        output_file = argv[2];
+    if (output_file) {
+        printf("output_file: %s\n", output_file);
         file = fopen(output_file, "wb");
         if (!file) {
-            fprintf(stderr, "Failed to open output file: %s\n", argv[2]);
+            fprintf(stderr, "Failed to open output file: %s\n", output_file);
+            fclose(fp);
             return -1;
         }
     }
@@ -801,7 +833,8 @@ int main(int argc, char **argv)
                 CHECK_VASTATUS(va_status, "vaSyncSurface");
 
                 if (file) {
-                    va_status = save_vaapi_surface(decoder.va_dpy, surface_id, decoder.crop_info, file);
+                    va_status = save_vaapi_surface(decoder.va_dpy, surface_id, decoder.crop_info, file,
+                                                   decoder.output_bit_depth);
                     CHECK_VASTATUS(va_status, "vaSaveSurface");
                 }
 

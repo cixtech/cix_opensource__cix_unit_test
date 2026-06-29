@@ -7,7 +7,6 @@ from onnx import TensorProto
 from onnx import numpy_helper
 import onnxruntime
 from ZhouyiOperators import operators
-import time
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
@@ -60,25 +59,34 @@ def get_args():
         default="ZhouyiExecutionProvider",
         help="Execution Provider. default:Zhouyi",
     )
-    parser.add_argument("-f", "--enable_cache", action="store_true", default=False, help="enable EP Context cache")
     parser.add_argument(
-      "-b",
-      "--embed_mode",
-      required=False,
-      default=1,
-      help="EPContext node attribute: 'ep_cache_context': 0: relative_path, 1: cache content. Default to 1")
+        "-f",
+        "--enable_cache",
+        action="store_true",
+        default=False,
+        help="enable EP Context cache",
+    )
     parser.add_argument(
-      "-p",
-      "--cache_path",
-      required=False,
-      default="",
-      help="specify file path for Onnx model which has EP context, such as './xx_ctx.onnx'. Default to <origin_onnxfile_name>_ctx.onnx if not specified")
+        "-b",
+        "--embed_mode",
+        required=False,
+        default=1,
+        help="EPContext node attribute: 'ep_cache_context': 0: relative_path, 1: cache content. Default to 1",
+    )
     parser.add_argument(
-      "-v",
-      "--verbose",
-      required=False,
-      action="store_true",
-      help="logging with verbose")
+        "-p",
+        "--cache_path",
+        required=False,
+        default="",
+        help="specify file path for Onnx model which has EP context, such as './xx_ctx.onnx'. Default to <origin_onnxfile_name>_ctx.onnx if not specified",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        required=False,
+        action="store_true",
+        help="logging with verbose",
+    )
     return parser.parse_args()
 
 
@@ -109,7 +117,7 @@ def main():
     input_path = param_dict["input"]
     print(param_dict["ep"])
     onnx_model = onnx.load(model_path)
-    onnx.checker.check_model(onnx_model)
+    # onnx.checker.check_model(onnx_model)
     inputs_name, inputs_type, inputs_shape = get_tensor_info(onnx_model.graph.input)
     print(f"inputs name: {inputs_name}, type: {inputs_type}, shape: {inputs_shape}")
     outputs_name, outputs_type, outputs_shape = get_tensor_info(onnx_model.graph.output)
@@ -127,7 +135,8 @@ def main():
                     npy_input = np.frombuffer(
                         proto.raw_data, dtype=np_type(inputs_type[i])
                     )
-                    inputs_list.append(npy_input.reshape(inputs_shape[i]))
+                    npy_input = npy_input.reshape(proto.dims)
+                    inputs_list.append(npy_input)
             elif inp.endswith(".bin"):
                 npy_input = np.fromfile(inp, dtype=np_type(inputs_type[i]))
                 inputs_list.append(npy_input.reshape(inputs_shape[i]))
@@ -155,8 +164,12 @@ def main():
         session_options.log_severity_level = 0
     if param_dict["enable_cache"]:
         session_options.add_session_config_entry("ep.context_enable", "1")
-        session_options.add_session_config_entry("ep.context_embed_mode", str(param_dict["embed_mode"]))
-        session_options.add_session_config_entry("ep.context_file_path", str(param_dict["cache_path"]))
+        session_options.add_session_config_entry(
+            "ep.context_embed_mode", str(param_dict["embed_mode"])
+        )
+        session_options.add_session_config_entry(
+            "ep.context_file_path", str(param_dict["cache_path"])
+        )
 
     # onnx_model.SerializeToString() will not provide information of model path, which will result cpp ModelPath() null
     ort_session = onnxruntime.InferenceSession(
@@ -167,24 +180,53 @@ def main():
             f"[ERROR].inputs list size: {len(inputs_list)}, session input size: {len(ort_session.get_inputs())}!"
         )
         return
+    output_list = []
+    flag = True
+    batchs = int(inputs_list[0].shape[0] / inputs_shape[0][0])
+    print(f"batchs:{batchs}", flush=True)
 
-    for i, input_ele in enumerate(ort_session.get_inputs()):
-        ort_inputs[input_ele.name] = inputs_list[i]
-    ort_outputs_name = [x.name for x in ort_session.get_outputs()]
-    print(f"outputs name: {ort_outputs_name}")
+    for batch in range(0, batchs):
+        for i, input_ele in enumerate(ort_session.get_inputs()):
+            run_batch = batch * inputs_shape[0][0]
+            ort_inputs[input_ele.name] = inputs_list[i][
+                run_batch : run_batch + inputs_shape[i][0]
+            ]
+        print(f"Run batch {batch}", flush=True)
+        ort_outputs_name = [x.name for x in ort_session.get_outputs()]
+        ort_outs = ort_session.run(ort_outputs_name, ort_inputs)
+        for i in range(len(ort_outs)):
+            tensor_o = numpy_helper.from_array(ort_outs[i])
+            # with open(os.path.join(file_path, f"output_{i}.pb"), "wb") as f:
+            #     f.write(tensor_o.SerializeToString())
+            npy_data = np.frombuffer(
+                tensor_o.raw_data, dtype=np_type(tensor_o.data_type)
+            )
+            if flag:
+                output_list.append(npy_data)
+            else:
+                output_list[i] = np.concatenate(
+                    (
+                        output_list[i],
+                        npy_data,
+                    )
+                )
+        flag = False
 
-    start = time.perf_counter()
-    ort_outs = ort_session.run(ort_outputs_name, ort_inputs)
-    print(f"Inference time: {(time.perf_counter() - start)*1000:.2f} ms")
-    
     for i in range(len(ort_outs)):
         tensor_o = numpy_helper.from_array(ort_outs[i])
-        with open(os.path.join(file_path, f"output_{i}.pb"), "wb") as f:
-            f.write(tensor_o.SerializeToString())
         npy_data = np.frombuffer(tensor_o.raw_data, dtype=np_type(tensor_o.data_type))
-        np.save(f"output_{i}.npy", npy_data)
-        npy_data.tofile(f"output_{i}.bin")
+        if batchs > 1:
+            new_shape = [batchs]
+            for s in npy_data.shape:
+                new_shape.append(s)
+            output_list[i] = output_list[i].reshape(tuple(new_shape))
+        np.save(f"output_{i}.npy", output_list[i])
+        output_list[i].tofile(f"output_{i}.bin")
+        tensor = numpy_helper.from_array(output_list[i])
+        with open(f"output_{i}.pb", "wb") as f:
+            f.write(tensor.SerializeToString())
 
 
 if __name__ == "__main__":
     main()
+

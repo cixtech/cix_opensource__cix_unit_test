@@ -63,6 +63,7 @@ typedef struct {
     int delta_pic_order_always_zero_flag;
     int redundant_pic_cnt_present_flag;
     int seq_update_flag;
+    int output_bit_depth;
 } H264Decoder;
 
 #endif /* H264DECODE_H */

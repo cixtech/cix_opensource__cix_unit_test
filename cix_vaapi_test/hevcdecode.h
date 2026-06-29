@@ -169,6 +169,7 @@ typedef struct {
     int no_rasl_output_flag;
     int last_eos_flag;
     int seq_update_flag;
+    int output_bit_depth;
 } HEVCDecoder;
 
 #endif /* HEVCDECODE_H */

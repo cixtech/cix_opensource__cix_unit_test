@@ -22,7 +22,7 @@
 #include <fcntl.h>
 #include <va/va.h>
 #include <va/va_drm.h>
-#include "va_display.h"
+#include "vadisplay.h"
 
 static int drm_fd = -1;
 

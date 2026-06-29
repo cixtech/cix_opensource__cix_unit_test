@@ -38,7 +38,10 @@ typedef struct {
 } CropInfo;
 
 int save_frame(uint8_t *y_plane, uint8_t *uv_plane, int crop_width, int crop_height,
-                                int uv_crop_width,int uv_crop_height, int y_stride, int uv_stride,FILE *file);
-int save_vaapi_surface(VADisplay display, VASurfaceID surface, CropInfo cropinfo, FILE* file);
+               int uv_crop_width, int uv_crop_height, int y_stride, int uv_stride, FILE *file,
+               int dump_bit_depth);
+/* output_bit_depth: kept for API symmetry with decoder -b; dump uses vaDeriveImage layout (NV12/P010). */
+int save_vaapi_surface(VADisplay display, VASurfaceID surface, CropInfo cropinfo, FILE *file,
+                       int output_bit_depth);
 
 #endif /* DUMPFRAME_H */
