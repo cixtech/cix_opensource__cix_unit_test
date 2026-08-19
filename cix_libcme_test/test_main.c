@@ -33,6 +33,7 @@
 #include "test_draw_rectangle.h"
 #include "test_detection_post_process.h"
 #include "test_nms_boxes.h"
+#include "test_argmax_val.h"
 #include "test_job_task.h"
 #include "test_multi_task.h"
 #include "test_img_copy.h"
@@ -59,6 +60,7 @@ static void usage(const char* prog)
     printf("  draw_rectangle       cme_2d_draw_rectangle: -i -w -h -f -x -y -p -q -R -G -B -t [-o]\n");
     printf("  detection_post_process cme_2d_detection_post_process: -g 1|2 OR -N -C -e -p -a [options]\n");
     printf("  nms_boxes            cme_2d_nms_boxes: -g 1 OR -N -b boxes.bin -S scores.bin [options]\n");
+    printf("  argmax_val           cme_argmax_val: -g 1 OR -i data.bin -d <n> [-o] [-n]\n");
     printf("  job_task             cme_begin_task + cme_2d_*_task + cme_end_task: job_task <kind> ...\n");
     printf("                       kinds: resize, cvtcolor, resize_cvtcolor_flip, overlay, crfrc,\n");
     printf("                              fisheye_remap, est_sim_tfm, cosine_sim, normalize,\n");
@@ -85,6 +87,7 @@ static void usage(const char* prog)
     printf("  %s draw_rectangle -i in.rgb -w 1920 -h 1080 -f rgb24 -x 100 -y 100 -p 400 -q 300 -R 255 -G 0 -B 0 -t 4 -o out.rgb\n", prog);
     printf("  %s detection_post_process -g 1\n", prog);
     printf("  %s nms_boxes -g 1\n", prog);
+    printf("  %s argmax_val -g 1\n", prog);
     printf("  %s job_task resize -i in.yuv -w 1920 -h 1080 -f nv12 -o out.yuv\n", prog);
     printf("  %s multi_task -i in.rgb -w 1920 -h 1080 -f rgb24 -W 112 -H 112 -o out.f32\n", prog);
 }
@@ -149,6 +152,9 @@ int main(int argc, char* argv[])
     }
     if (strcmp(test, "nms_boxes") == 0) {
         return test_nms_boxes(argc, argv);
+    }
+    if (strcmp(test, "argmax_val") == 0) {
+        return test_argmax_val(argc, argv);
     }
     if (strcmp(test, "job_task") == 0) {
         return test_job_task(argc, argv);
